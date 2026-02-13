@@ -93,6 +93,7 @@ class FBXScene:
     metadata: Dict[str, Any] = field(default_factory=dict)
     _original_scene: Any = None  # Reference to original FBX scene object
     _backend: Any = None  # Reference to backend for saving
+    _target_uv_channel: int = None  # Target UV channel to update (for selective updates)
     
     def get_mesh_by_name(self, name: str) -> Optional[MeshData]:
         """Get mesh by name."""
@@ -101,6 +102,14 @@ class FBXScene:
     def get_all_meshes(self) -> List[MeshData]:
         """Get all meshes in scene."""
         return list(self.meshes.values())
+    
+    def set_target_uv_channel(self, channel_index: int):
+        """Set the target UV channel to update when saving."""
+        self._target_uv_channel = channel_index
+    
+    def get_target_uv_channel(self) -> Optional[int]:
+        """Get the target UV channel to update."""
+        return self._target_uv_channel
 
 
 class FBXBackendBase:

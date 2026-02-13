@@ -283,8 +283,18 @@ class OfficialFBXBackend(BaseFBXHandler):
             self.logger.info("Using original FBX scene to preserve all data")
             fbx_scene = scene._original_scene
             
+            # Get target UV channel if set
+            target_uv_channel = None
+            if hasattr(scene, 'get_target_uv_channel'):
+                target_uv_channel = scene.get_target_uv_channel()
+            
+            if target_uv_channel is not None:
+                self.logger.info(f"Will only update UV channel {target_uv_channel}")
+            else:
+                self.logger.info("Will update all UV channels")
+            
             # Update UV data in original scene
-            self._update_uv_in_scene(fbx_scene, scene)
+            self._update_uv_in_scene(fbx_scene, scene, target_uv_channel)
         else:
             self.logger.warning("No original scene, creating new FBX (may lose materials/normals)")
             # Create new scene (fallback)
@@ -313,8 +323,14 @@ class OfficialFBXBackend(BaseFBXHandler):
         
         return success
     
-    def _update_uv_in_scene(self, fbx_scene, scene: FBXScene) -> None:
-        """Update UV data in the original FBX scene."""
+    def _update_uv_in_scene(self, fbx_scene, scene: FBXScene, target_uv_channel: int = None) -> None:
+        """Update UV data in the original FBX scene.
+        
+        Args:
+            fbx_scene: The original FBX scene
+            scene: The FBXScene wrapper containing updated mesh data
+            target_uv_channel: Specific UV channel index to update. If None, updates all channels.
+        """
         root_node = fbx_scene.GetRootNode()
         if not root_node:
             return
@@ -335,9 +351,13 @@ class OfficialFBXBackend(BaseFBXHandler):
                         break
                 
                 if mesh_data:
-                    # Update UV channels
+                    # Update only the specified UV channel, or all if not specified
                     for uv_channel_name, uv_channel in mesh_data.uv_channels.items():
-                        self._update_mesh_uv(mesh_attr, uv_channel)
+                        if target_uv_channel is None or uv_channel.index == target_uv_channel:
+                            self._update_mesh_uv(mesh_attr, uv_channel)
+                            self.logger.info(f"Updated UV channel {uv_channel.index} ({uv_channel_name})")
+                        else:
+                            self.logger.info(f"Skipped UV channel {uv_channel.index} ({uv_channel_name})")
     
     def _add_mesh_to_scene(self, scene, mesh_data: MeshData):
         """Add mesh to FBX scene."""

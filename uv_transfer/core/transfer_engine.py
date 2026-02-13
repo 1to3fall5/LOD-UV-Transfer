@@ -765,6 +765,11 @@ class UVTransferEngine:
         if self._target_scene is None:
             raise TransferError("No target scene to save", error_code=3006)
         
+        # Set target UV channel to only update the specified channel
+        if hasattr(self._target_scene, 'set_target_uv_channel'):
+            self._target_scene.set_target_uv_channel(self.config.target_uv_channel)
+            self.logger.info(f"Set target UV channel to {self.config.target_uv_channel} for selective update")
+        
         with OperationContext(self.logger, "save_result", f"Saving to {output_path}"):
             return self.fbx_handler.save(self._target_scene, output_path)
     
