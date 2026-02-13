@@ -356,7 +356,7 @@ class OfficialFBXBackend(BaseFBXHandler):
         try:
             uv_layer = mesh.CreateElementUV(uv_channel.name)
             
-            # Set mapping and reference modes
+            # Set mapping mode
             try:
                 mapping_mode = fbx.FbxLayerElement.eByPolygonVertex
             except AttributeError:
@@ -365,21 +365,52 @@ class OfficialFBXBackend(BaseFBXHandler):
                 except AttributeError:
                     mapping_mode = 2
             
+            # Use IndexToDirect reference mode to support shared UV coordinates
             try:
-                reference_mode = fbx.FbxLayerElement.eDirect
+                reference_mode = fbx.FbxLayerElement.eIndexToDirect
             except AttributeError:
                 try:
-                    reference_mode = fbx.FbxLayerElement.EReferenceMode.eDirect
+                    reference_mode = fbx.FbxLayerElement.EReferenceMode.eIndexToDirect
                 except AttributeError:
-                    reference_mode = 0
+                    reference_mode = 1  # eIndexToDirect = 1
             
             uv_layer.SetMappingMode(mapping_mode)
             uv_layer.SetReferenceMode(reference_mode)
             
-            # Add UV coordinates
+            # Add UV coordinates to direct array
             direct_array = uv_layer.GetDirectArray()
-            for uv in uv_channel.uv_coordinates:
-                direct_array.Add(fbx.FbxVector2(uv[0], uv[1]))
+            
+            # Check if we have uv_indices - if so, we need to deduplicate UVs
+            if uv_channel.uv_indices is not None and len(uv_channel.uv_indices) > 0:
+                # Use unique UV coordinates from the direct array
+                unique_uvs = []
+                uv_index_map = {}
+                
+                for i, uv in enumerate(uv_channel.uv_coordinates):
+                    uv_tuple = (float(uv[0]), float(uv[1]))
+                    if uv_tuple not in uv_index_map:
+                        uv_index_map[uv_tuple] = len(unique_uvs)
+                        unique_uvs.append(uv_tuple)
+                        direct_array.Add(fbx.FbxVector2(uv[0], uv[1]))
+                
+                # Add indices to index array
+                index_array = uv_layer.GetIndexArray()
+                index_array.Resize(len(uv_channel.uv_indices))
+                
+                for i, uv_idx in enumerate(uv_channel.uv_indices):
+                    if uv_idx < len(uv_channel.uv_coordinates):
+                        uv = uv_channel.uv_coordinates[uv_idx]
+                        uv_tuple = (float(uv[0]), float(uv[1]))
+                        if uv_tuple in uv_index_map:
+                            index_array.SetAt(i, uv_index_map[uv_tuple])
+                        else:
+                            index_array.SetAt(i, 0)
+                    else:
+                        index_array.SetAt(i, 0)
+            else:
+                # No indices - add all UV coordinates directly
+                for uv in uv_channel.uv_coordinates:
+                    direct_array.Add(fbx.FbxVector2(uv[0], uv[1]))
                 
         except Exception as e:
             self.logger.warning(f"Failed to add UV layer: {e}")
