@@ -29,12 +29,20 @@ class TransferMode(Enum):
     INTERPOLATED = "interpolated"
 
 
+class TransferAlgorithm(Enum):
+    """UV transfer algorithms."""
+    TRIANGLE_CENTER = "triangle_center"  # Best balance
+    AREA_WEIGHTED = "area_weighted"      # Better UV island preservation
+    NORMAL_AWARE = "normal_aware"        # Best for curved surfaces
+
+
 @dataclass
 class TransferConfig:
     """Configuration for UV transfer operation."""
     source_uv_channel: int = 0
     target_uv_channel: int = 0
     mode: TransferMode = TransferMode.SPATIAL
+    algorithm: TransferAlgorithm = TransferAlgorithm.TRIANGLE_CENTER
     create_target_channel: bool = True
     validate_source: bool = True
     validate_result: bool = True
@@ -271,52 +279,275 @@ class UVTransferEngine:
         config: TransferConfig
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute target UV coordinates based on transfer mode.
+        Compute target UV coordinates using selected algorithm.
         
-        For LOD models, UVs are independently unwrapped, so we need to match
-        based on vertex position rather than vertex index.
+        Supports three algorithms:
+        - TRIANGLE_CENTER: Match triangles by center position (best balance)
+        - AREA_WEIGHTED: Consider triangle area for better UV island preservation
+        - NORMAL_AWARE: Consider face normals for curved surfaces
         
         Returns:
             Tuple of (uv_coordinates, uv_indices) for per-face-vertex UV mapping.
         """
-        # Calculate total face vertices for target mesh
-        total_face_vertices = sum(len(face) for face in target_mesh.faces)
+        self.logger.info(f"Using algorithm: {config.algorithm.value}")
         
-        # Build source face-vertex UVs and positions
+        # Build source data structures
         source_face_vertex_uvs = self._build_source_face_vertex_uvs(source_mesh, source_uv)
         source_face_vertex_positions = self._build_source_face_vertex_positions(source_mesh)
         
-        # Build KD-tree for fast nearest neighbor search
+        # Build source face data
+        source_face_centers = self._build_face_centers(source_mesh)
+        source_face_normals = self._build_face_normals(source_mesh)
+        source_face_areas = self._build_face_areas(source_mesh)
+        
+        # Route to specific algorithm
+        if config.algorithm == TransferAlgorithm.TRIANGLE_CENTER:
+            return self._algorithm_triangle_center(
+                source_mesh, target_mesh, source_face_vertex_uvs,
+                source_face_vertex_positions, source_face_centers
+            )
+        elif config.algorithm == TransferAlgorithm.AREA_WEIGHTED:
+            return self._algorithm_area_weighted(
+                source_mesh, target_mesh, source_face_vertex_uvs,
+                source_face_vertex_positions, source_face_centers, source_face_areas
+            )
+        elif config.algorithm == TransferAlgorithm.NORMAL_AWARE:
+            return self._algorithm_normal_aware(
+                source_mesh, target_mesh, source_face_vertex_uvs,
+                source_face_vertex_positions, source_face_centers, source_face_normals
+            )
+        else:
+            raise ValueError(f"Unknown algorithm: {config.algorithm}")
+    
+    def _build_face_centers(self, mesh: MeshData) -> np.ndarray:
+        """Build face center array."""
+        centers = np.zeros((len(mesh.faces), 3), dtype=np.float64)
+        for i, face in enumerate(mesh.faces):
+            verts = [mesh.vertices[v] for v in face]
+            centers[i] = np.mean(verts, axis=0)
+        return centers
+    
+    def _build_face_normals(self, mesh: MeshData) -> np.ndarray:
+        """Build face normal array."""
+        normals = np.zeros((len(mesh.faces), 3), dtype=np.float64)
+        for i, face in enumerate(mesh.faces):
+            if len(face) >= 3:
+                v0 = mesh.vertices[face[0]]
+                v1 = mesh.vertices[face[1]]
+                v2 = mesh.vertices[face[2]]
+                normal = np.cross(v1 - v0, v2 - v0)
+                norm = np.linalg.norm(normal)
+                if norm > 0:
+                    normals[i] = normal / norm
+        return normals
+    
+    def _build_face_areas(self, mesh: MeshData) -> np.ndarray:
+        """Build face area array."""
+        areas = np.zeros(len(mesh.faces), dtype=np.float64)
+        for i, face in enumerate(mesh.faces):
+            if len(face) >= 3:
+                v0 = mesh.vertices[face[0]]
+                v1 = mesh.vertices[face[1]]
+                v2 = mesh.vertices[face[2]]
+                areas[i] = 0.5 * np.linalg.norm(np.cross(v1 - v0, v2 - v0))
+        return areas
+    
+    def _algorithm_triangle_center(
+        self,
+        source_mesh: MeshData,
+        target_mesh: MeshData,
+        source_face_vertex_uvs: np.ndarray,
+        source_face_vertex_positions: np.ndarray,
+        source_face_centers: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Algorithm 2: Triangle center matching."""
         from scipy.spatial import cKDTree
-        source_tree = cKDTree(source_face_vertex_positions)
         
-        # Compute UVs for each target face vertex
-        target_uv_coords = np.zeros((total_face_vertices, 2), dtype=np.float64)
-        target_uv_indices = np.arange(total_face_vertices, dtype=np.int32)
+        total = sum(len(face) for face in target_mesh.faces)
+        target_uvs = np.zeros((total, 2), dtype=np.float64)
         
-        fv_idx = 0  # face-vertex index
-        for face in target_mesh.faces:
-            for vert_idx in face:
-                target_pos = target_mesh.vertices[vert_idx]
+        # Build KD-tree for source face centers
+        tree = cKDTree(source_face_centers)
+        
+        target_fv_idx = 0
+        for target_face in target_mesh.faces:
+            # Calculate target face center
+            target_verts = [target_mesh.vertices[v] for v in target_face]
+            target_center = np.mean(target_verts, axis=0)
+            
+            # Find nearest source face
+            _, source_face_idx = tree.query(target_center, k=1)
+            source_face = source_mesh.faces[source_face_idx]
+            
+            # Map target vertices to source vertices by position
+            for i, target_vert_idx in enumerate(target_face):
+                target_pos = target_mesh.vertices[target_vert_idx]
                 
-                # Find nearest source face vertex by position
-                distance, nearest_idx = source_tree.query(target_pos, k=1)
+                # Find best matching source vertex in the source face
+                best_dist = float('inf')
+                best_uv = np.array([0.0, 0.0])
                 
-                if distance < 0.001:  # 1mm threshold
-                    # Use the UV from the nearest source face vertex
-                    target_uv_coords[fv_idx] = source_face_vertex_uvs[nearest_idx]
+                for j, source_vert_idx in enumerate(source_face):
+                    source_pos = source_mesh.vertices[source_vert_idx]
+                    dist = np.linalg.norm(target_pos - source_pos)
+                    
+                    # Get UV for this source face vertex
+                    source_fv_idx = sum(len(source_mesh.faces[k]) for k in range(source_face_idx)) + j
+                    if source_fv_idx < len(source_face_vertex_uvs):
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_uv = source_face_vertex_uvs[source_fv_idx]
+                
+                target_uvs[target_fv_idx] = best_uv
+                target_fv_idx += 1
+        
+        return normalize_uv(target_uvs), np.arange(total, dtype=np.int32)
+    
+    def _algorithm_area_weighted(
+        self,
+        source_mesh: MeshData,
+        target_mesh: MeshData,
+        source_face_vertex_uvs: np.ndarray,
+        source_face_vertex_positions: np.ndarray,
+        source_face_centers: np.ndarray,
+        source_face_areas: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Algorithm 3: Area-weighted triangle matching."""
+        from scipy.spatial import cKDTree
+        
+        total = sum(len(face) for face in target_mesh.faces)
+        target_uvs = np.zeros((total, 2), dtype=np.float64)
+        
+        # Build KD-tree for source face centers
+        tree = cKDTree(source_face_centers)
+        
+        target_fv_idx = 0
+        for target_face in target_mesh.faces:
+            # Calculate target face center and area
+            target_verts = [target_mesh.vertices[v] for v in target_face]
+            target_center = np.mean(target_verts, axis=0)
+            
+            if len(target_face) >= 3:
+                target_area = 0.5 * np.linalg.norm(
+                    np.cross(target_verts[1] - target_verts[0], 
+                            target_verts[2] - target_verts[0])
+                )
+            else:
+                target_area = 0
+            
+            # Find multiple nearest source faces
+            distances, source_face_indices = tree.query(target_center, k=min(5, len(source_mesh.faces)))
+            
+            # Weight by inverse distance and area similarity
+            best_face_idx = source_face_indices[0]
+            best_score = float('inf')
+            
+            for idx in source_face_indices:
+                area_diff = abs(source_face_areas[idx] - target_area)
+                score = distances[list(source_face_indices).index(idx)] + area_diff * 0.1
+                if score < best_score:
+                    best_score = score
+                    best_face_idx = idx
+            
+            source_face = source_mesh.faces[best_face_idx]
+            
+            # Map vertices
+            for i, target_vert_idx in enumerate(target_face):
+                target_pos = target_mesh.vertices[target_vert_idx]
+                
+                best_dist = float('inf')
+                best_uv = np.array([0.0, 0.0])
+                
+                for j, source_vert_idx in enumerate(source_face):
+                    source_pos = source_mesh.vertices[source_vert_idx]
+                    dist = np.linalg.norm(target_pos - source_pos)
+                    
+                    source_fv_idx = sum(len(source_mesh.faces[k]) for k in range(best_face_idx)) + j
+                    if source_fv_idx < len(source_face_vertex_uvs):
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_uv = source_face_vertex_uvs[source_fv_idx]
+                
+                target_uvs[target_fv_idx] = best_uv
+                target_fv_idx += 1
+        
+        return normalize_uv(target_uvs), np.arange(total, dtype=np.int32)
+    
+    def _algorithm_normal_aware(
+        self,
+        source_mesh: MeshData,
+        target_mesh: MeshData,
+        source_face_vertex_uvs: np.ndarray,
+        source_face_vertex_positions: np.ndarray,
+        source_face_centers: np.ndarray,
+        source_face_normals: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Algorithm 4: Normal-aware triangle matching."""
+        from scipy.spatial import cKDTree
+        
+        total = sum(len(face) for face in target_mesh.faces)
+        target_uvs = np.zeros((total, 2), dtype=np.float64)
+        
+        # Build KD-tree for source face centers
+        tree = cKDTree(source_face_centers)
+        
+        target_fv_idx = 0
+        for target_face in target_mesh.faces:
+            # Calculate target face center and normal
+            target_verts = [target_mesh.vertices[v] for v in target_face]
+            target_center = np.mean(target_verts, axis=0)
+            
+            if len(target_face) >= 3:
+                target_normal = np.cross(
+                    target_verts[1] - target_verts[0],
+                    target_verts[2] - target_verts[0]
+                )
+                norm = np.linalg.norm(target_normal)
+                if norm > 0:
+                    target_normal = target_normal / norm
                 else:
-                    # No close match - interpolate from nearest vertices
-                    uv = self._interpolate_uv_at_position(
-                        target_pos,
-                        source_mesh,
-                        source_face_vertex_uvs
-                    )
-                    target_uv_coords[fv_idx] = uv
+                    target_normal = np.array([0, 0, 1])
+            else:
+                target_normal = np.array([0, 0, 1])
+            
+            # Find multiple nearest source faces
+            distances, source_face_indices = tree.query(target_center, k=min(5, len(source_mesh.faces)))
+            
+            # Weight by distance and normal similarity
+            best_face_idx = source_face_indices[0]
+            best_score = float('inf')
+            
+            for idx in source_face_indices:
+                normal_sim = np.dot(source_face_normals[idx], target_normal)
+                normal_penalty = (1 - normal_sim) * 10  # Penalize different normals
+                score = distances[list(source_face_indices).index(idx)] + normal_penalty
+                if score < best_score:
+                    best_score = score
+                    best_face_idx = idx
+            
+            source_face = source_mesh.faces[best_face_idx]
+            
+            # Map vertices
+            for i, target_vert_idx in enumerate(target_face):
+                target_pos = target_mesh.vertices[target_vert_idx]
                 
-                fv_idx += 1
+                best_dist = float('inf')
+                best_uv = np.array([0.0, 0.0])
+                
+                for j, source_vert_idx in enumerate(source_face):
+                    source_pos = source_mesh.vertices[source_vert_idx]
+                    dist = np.linalg.norm(target_pos - source_pos)
+                    
+                    source_fv_idx = sum(len(source_mesh.faces[k]) for k in range(best_face_idx)) + j
+                    if source_fv_idx < len(source_face_vertex_uvs):
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_uv = source_face_vertex_uvs[source_fv_idx]
+                
+                target_uvs[target_fv_idx] = best_uv
+                target_fv_idx += 1
         
-        return normalize_uv(target_uv_coords), target_uv_indices
+        return normalize_uv(target_uvs), np.arange(total, dtype=np.int32)
     
     def _build_source_face_vertex_positions(
         self,

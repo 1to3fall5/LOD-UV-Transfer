@@ -9,7 +9,7 @@ import json
 from typing import Optional
 
 from .utils.logger import setup_logger, get_logger
-from .core.transfer_engine import UVTransferEngine, TransferConfig, TransferMode
+from .core.transfer_engine import UVTransferEngine, TransferConfig, TransferMode, TransferAlgorithm
 from .batch.batch_processor import BatchProcessor, BatchItem
 from .batch.config_manager import ConfigManager
 from .visualization.uv_viewer import UVViewer
@@ -53,6 +53,9 @@ Examples:
     transfer_parser.add_argument('--target-mesh', help='Target mesh name (auto-detect if not specified)')
     transfer_parser.add_argument('--mode', choices=['direct', 'spatial', 'interpolated'], 
                                  default='spatial', help='Transfer mode')
+    transfer_parser.add_argument('--algorithm', choices=['triangle_center', 'area_weighted', 'normal_aware'], 
+                                 default='triangle_center', 
+                                 help='UV transfer algorithm (triangle_center: best balance, area_weighted: preserves UV islands better, normal_aware: best for curved surfaces)')
     transfer_parser.add_argument('--preset', help='Use configuration preset')
     transfer_parser.add_argument('--no-validate', action='store_true', help='Skip validation')
     transfer_parser.add_argument('--smooth', type=int, default=0, help='Smooth iterations')
@@ -117,10 +120,17 @@ def cmd_transfer(args) -> int:
             'interpolated': TransferMode.INTERPOLATED
         }
         
+        algorithm_map = {
+            'triangle_center': TransferAlgorithm.TRIANGLE_CENTER,
+            'area_weighted': TransferAlgorithm.AREA_WEIGHTED,
+            'normal_aware': TransferAlgorithm.NORMAL_AWARE,
+        }
+        
         config = TransferConfig(
             source_uv_channel=args.source_uv,
             target_uv_channel=args.target_uv,
             mode=mode_map[args.mode],
+            algorithm=algorithm_map[args.algorithm],
             validate_source=not args.no_validate,
             validate_result=not args.no_validate,
             smooth_iterations=args.smooth,
