@@ -273,14 +273,22 @@ class UVTransferEngine:
         """
         Compute target UV coordinates based on transfer mode.
         
+        For LOD models, UVs are independently unwrapped, so we need to match
+        based on vertex position rather than vertex index.
+        
         Returns:
             Tuple of (uv_coordinates, uv_indices) for per-face-vertex UV mapping.
         """
         # Calculate total face vertices for target mesh
         total_face_vertices = sum(len(face) for face in target_mesh.faces)
         
-        # Build source face-vertex UVs if needed
+        # Build source face-vertex UVs and positions
         source_face_vertex_uvs = self._build_source_face_vertex_uvs(source_mesh, source_uv)
+        source_face_vertex_positions = self._build_source_face_vertex_positions(source_mesh)
+        
+        # Build KD-tree for fast nearest neighbor search
+        from scipy.spatial import cKDTree
+        source_tree = cKDTree(source_face_vertex_positions)
         
         # Compute UVs for each target face vertex
         target_uv_coords = np.zeros((total_face_vertices, 2), dtype=np.float64)
@@ -289,19 +297,18 @@ class UVTransferEngine:
         fv_idx = 0  # face-vertex index
         for face in target_mesh.faces:
             for vert_idx in face:
-                # Get the source vertex mapping for this target vertex
-                source_vert_idx = vertex_mapping[vert_idx]
+                target_pos = target_mesh.vertices[vert_idx]
                 
-                if source_vert_idx >= 0:
-                    # Find corresponding source face vertex UV
-                    uv = self._get_source_uv_at_vertex(
-                        source_mesh, source_face_vertex_uvs, source_vert_idx
-                    )
-                    target_uv_coords[fv_idx] = uv
+                # Find nearest source face vertex by position
+                distance, nearest_idx = source_tree.query(target_pos, k=1)
+                
+                if distance < 0.001:  # 1mm threshold
+                    # Use the UV from the nearest source face vertex
+                    target_uv_coords[fv_idx] = source_face_vertex_uvs[nearest_idx]
                 else:
-                    # No mapping - use spatial interpolation
+                    # No close match - interpolate from nearest vertices
                     uv = self._interpolate_uv_at_position(
-                        target_mesh.vertices[vert_idx],
+                        target_pos,
                         source_mesh,
                         source_face_vertex_uvs
                     )
@@ -310,6 +317,22 @@ class UVTransferEngine:
                 fv_idx += 1
         
         return normalize_uv(target_uv_coords), target_uv_indices
+    
+    def _build_source_face_vertex_positions(
+        self,
+        source_mesh: MeshData
+    ) -> np.ndarray:
+        """Build per-face-vertex position array from source mesh."""
+        total_face_vertices = sum(len(face) for face in source_mesh.faces)
+        positions = np.zeros((total_face_vertices, 3), dtype=np.float64)
+        
+        fv_idx = 0
+        for face in source_mesh.faces:
+            for vert_idx in face:
+                positions[fv_idx] = source_mesh.vertices[vert_idx]
+                fv_idx += 1
+        
+        return positions
     
     def _build_source_face_vertex_uvs(
         self,
@@ -344,20 +367,37 @@ class UVTransferEngine:
         self,
         source_mesh: MeshData,
         source_face_vertex_uvs: np.ndarray,
-        vertex_idx: int
+        vertex_idx: int,
+        target_face_idx: int = -1,
+        target_face_vert_idx: int = -1
     ) -> np.ndarray:
-        """Get UV at a specific source vertex (average of all face vertices at this vertex)."""
-        uvs = []
+        """
+        Get UV at a specific source vertex.
+        
+        For LOD models, we need to find the corresponding face vertex UV.
+        If the vertex is used in multiple faces with different UVs, we need to
+        find the best matching face based on the target face context.
+        """
+        # Collect all UVs for this vertex
+        uvs_at_vertex = []
         fv_idx = 0
         for face in source_mesh.faces:
             for v_idx in face:
                 if v_idx == vertex_idx and fv_idx < len(source_face_vertex_uvs):
-                    uvs.append(source_face_vertex_uvs[fv_idx])
+                    uvs_at_vertex.append((fv_idx, source_face_vertex_uvs[fv_idx]))
                 fv_idx += 1
         
-        if uvs:
-            return np.mean(uvs, axis=0)
-        return np.array([0.0, 0.0])
+        if not uvs_at_vertex:
+            return np.array([0.0, 0.0])
+        
+        # If only one UV, return it
+        if len(uvs_at_vertex) == 1:
+            return uvs_at_vertex[0][1]
+        
+        # For vertices with multiple UVs (on UV seams), we need to choose the right one
+        # For now, return the first one (this is a simplification)
+        # A better approach would be to match based on face normal or position
+        return uvs_at_vertex[0][1]
     
     def _interpolate_uv_at_position(
         self,
