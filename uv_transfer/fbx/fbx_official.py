@@ -71,10 +71,15 @@ class OfficialFBXBackend(BaseFBXHandler):
         
         self.logger.info(f"Loaded FBX: {len(meshes)} meshes, file: {file_path}")
         
-        return FBXScene(
+        # Store original scene and backend reference for saving
+        fbx_scene = FBXScene(
             file_path=file_path,
             meshes={mesh.name: mesh for mesh in meshes}
         )
+        fbx_scene._original_scene = scene
+        fbx_scene._backend = self
+        
+        return fbx_scene
     
     def _extract_meshes(self, scene) -> List[MeshData]:
         """Extract mesh data from FBX scene."""
@@ -264,34 +269,75 @@ class OfficialFBXBackend(BaseFBXHandler):
         )
     
     def save(self, scene: FBXScene, file_path: Union[str, Path]) -> bool:
-        """Save scene to FBX file."""
-        file_path = str(file_path)
+        """Save FBX file using official SDK.
         
-        try:
-            # Create new scene
-            new_scene = self._fbx_module.FbxScene.Create(self._sdk_manager, "export_scene")
+        If the scene has an original FBX scene reference, it will modify the UV data
+        in the original scene and save it, preserving all other data (materials, normals, etc.).
+        Otherwise, it creates a new scene from scratch.
+        """
+        file_path = str(file_path)
+        self.logger.info(f"fbx_save", f"Starting: Saving to {file_path}")
+        
+        # Check if we have original scene to preserve all data
+        if hasattr(scene, '_original_scene') and scene._original_scene is not None:
+            self.logger.info("Using original FBX scene to preserve all data")
+            fbx_scene = scene._original_scene
+            
+            # Update UV data in original scene
+            self._update_uv_in_scene(fbx_scene, scene)
+        else:
+            self.logger.warning("No original scene, creating new FBX (may lose materials/normals)")
+            # Create new scene (fallback)
+            fbx_scene = self._fbx_module.FbxScene.Create(self._sdk_manager, "export_scene")
             
             # Add meshes to scene
             for mesh_name, mesh_data in scene.meshes.items():
-                self._add_mesh_to_scene(new_scene, mesh_data)
-            
-            # Export
-            exporter = self._fbx_module.FbxExporter.Create(self._sdk_manager, "")
-            
-            if not exporter.Initialize(file_path, -1, self._io_settings):
-                self.logger.error(f"Failed to initialize exporter for {file_path}")
-                return False
-            
-            exporter.Export(new_scene)
-            exporter.Destroy()
-            new_scene.Destroy()
-            
-            self.logger.info(f"Saved FBX: {file_path}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to save FBX: {e}")
+                self._add_mesh_to_scene(fbx_scene, mesh_data)
+        
+        # Create exporter
+        exporter = self._fbx_module.FbxExporter.Create(self._sdk_manager, "")
+        
+        if not exporter.Initialize(file_path, -1, self._io_settings):
+            error_msg = exporter.GetStatus().GetErrorString()
+            self.logger.error(f"Failed to initialize FBX exporter: {error_msg}")
             return False
+        
+        # Export
+        success = exporter.Export(fbx_scene)
+        exporter.Destroy()
+        
+        if success:
+            self.logger.info(f"Successfully saved FBX: {file_path}")
+        else:
+            self.logger.error(f"Failed to save FBX: {file_path}")
+        
+        return success
+    
+    def _update_uv_in_scene(self, fbx_scene, scene: FBXScene) -> None:
+        """Update UV data in the original FBX scene."""
+        root_node = fbx_scene.GetRootNode()
+        if not root_node:
+            return
+        
+        for i in range(root_node.GetChildCount()):
+            node = root_node.GetChild(i)
+            mesh_attr = node.GetMesh()
+            
+            if mesh_attr:
+                mesh_name = node.GetName()
+                
+                # Find corresponding mesh data
+                mesh_data = scene.meshes.get(mesh_name)
+                if not mesh_data:
+                    # Try to find by index or any mesh
+                    for name, data in scene.meshes.items():
+                        mesh_data = data
+                        break
+                
+                if mesh_data:
+                    # Update UV channels
+                    for uv_channel_name, uv_channel in mesh_data.uv_channels.items():
+                        self._update_mesh_uv(mesh_attr, uv_channel)
     
     def _add_mesh_to_scene(self, scene, mesh_data: MeshData):
         """Add mesh to FBX scene."""
@@ -414,3 +460,100 @@ class OfficialFBXBackend(BaseFBXHandler):
                 
         except Exception as e:
             self.logger.warning(f"Failed to add UV layer: {e}")
+    
+    def _update_mesh_uv(self, mesh, uv_channel: UVChannel):
+        """Update UV layer in existing mesh."""
+        fbx = self._fbx_module
+        
+        try:
+            # Find existing UV layer or create new one
+            uv_layer = None
+            uv_element_count = mesh.GetElementUVCount()
+            
+            # Try to find existing UV layer with matching name or index
+            for i in range(uv_element_count):
+                element = mesh.GetElementUV(i)
+                if element:
+                    element_name = element.GetName()
+                    # Match by name or use index-based naming
+                    if (element_name == uv_channel.name or 
+                        element_name == f"UVChannel_{uv_channel.index}" or
+                        (uv_channel.index == 0 and i == 0) or
+                        (uv_channel.index == 1 and i == 1)):
+                        uv_layer = element
+                        self.logger.info(f"Found existing UV layer: {element_name}")
+                        break
+            
+            # If no existing layer found, create new one
+            if uv_layer is None:
+                self.logger.info(f"Creating new UV layer: {uv_channel.name}")
+                uv_layer = mesh.CreateElementUV(uv_channel.name)
+                
+                # Set mapping mode
+                try:
+                    mapping_mode = fbx.FbxLayerElement.eByPolygonVertex
+                except AttributeError:
+                    try:
+                        mapping_mode = fbx.FbxLayerElement.EMappingMode.eByPolygonVertex
+                    except AttributeError:
+                        mapping_mode = 2
+                
+                # Use IndexToDirect reference mode
+                try:
+                    reference_mode = fbx.FbxLayerElement.eIndexToDirect
+                except AttributeError:
+                    try:
+                        reference_mode = fbx.FbxLayerElement.EReferenceMode.eIndexToDirect
+                    except AttributeError:
+                        reference_mode = 1
+                
+                uv_layer.SetMappingMode(mapping_mode)
+                uv_layer.SetReferenceMode(reference_mode)
+            
+            # Clear existing data
+            direct_array = uv_layer.GetDirectArray()
+            direct_array.Clear()
+            
+            index_array = uv_layer.GetIndexArray()
+            index_array.Clear()
+            
+            # Add UV coordinates
+            if uv_channel.uv_indices is not None and len(uv_channel.uv_indices) > 0:
+                # Use unique UV coordinates
+                unique_uvs = []
+                uv_index_map = {}
+                
+                for i, uv in enumerate(uv_channel.uv_coordinates):
+                    uv_tuple = (float(uv[0]), float(uv[1]))
+                    if uv_tuple not in uv_index_map:
+                        uv_index_map[uv_tuple] = len(unique_uvs)
+                        unique_uvs.append(uv_tuple)
+                        direct_array.Add(fbx.FbxVector2(uv[0], uv[1]))
+                
+                # Add indices
+                index_array.Resize(len(uv_channel.uv_indices))
+                for i, uv_idx in enumerate(uv_channel.uv_indices):
+                    if uv_idx < len(uv_channel.uv_coordinates):
+                        uv = uv_channel.uv_coordinates[uv_idx]
+                        uv_tuple = (float(uv[0]), float(uv[1]))
+                        if uv_tuple in uv_index_map:
+                            index_array.SetAt(i, uv_index_map[uv_tuple])
+                        else:
+                            index_array.SetAt(i, 0)
+                    else:
+                        index_array.SetAt(i, 0)
+            else:
+                # Direct mapping - add all UVs
+                for uv in uv_channel.uv_coordinates:
+                    direct_array.Add(fbx.FbxVector2(uv[0], uv[1]))
+                
+                # Create sequential indices
+                index_array.Resize(len(uv_channel.uv_coordinates))
+                for i in range(len(uv_channel.uv_coordinates)):
+                    index_array.SetAt(i, i)
+            
+            self.logger.info(f"Updated UV layer with {direct_array.GetCount()} unique UVs, "
+                           f"{index_array.GetCount()} indices")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to update UV layer: {e}")

@@ -91,6 +91,8 @@ class FBXScene:
     file_path: str
     meshes: Dict[str, MeshData] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    _original_scene: Any = None  # Reference to original FBX scene object
+    _backend: Any = None  # Reference to backend for saving
     
     def get_mesh_by_name(self, name: str) -> Optional[MeshData]:
         """Get mesh by name."""
