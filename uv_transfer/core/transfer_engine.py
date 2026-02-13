@@ -214,7 +214,7 @@ class UVTransferEngine:
             f"({result.match_rate:.1%})"
         )
         
-        target_uv_coords = self._compute_target_uvs(
+        target_uv_coords, target_uv_indices = self._compute_target_uvs(
             source_mesh,
             target_mesh,
             source_uv,
@@ -233,6 +233,7 @@ class UVTransferEngine:
             target_mesh,
             config.target_uv_channel,
             target_uv_coords,
+            target_uv_indices,
             config.create_target_channel
         )
         
@@ -268,32 +269,119 @@ class UVTransferEngine:
         source_uv: UVChannel,
         vertex_mapping: np.ndarray,
         config: TransferConfig
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute target UV coordinates based on transfer mode.
+        
+        Returns:
+            Tuple of (uv_coordinates, uv_indices) for per-face-vertex UV mapping.
+        """
+        # Calculate total face vertices for target mesh
+        total_face_vertices = sum(len(face) for face in target_mesh.faces)
+        
+        # Build source face-vertex UVs if needed
+        source_face_vertex_uvs = self._build_source_face_vertex_uvs(source_mesh, source_uv)
+        
+        # Compute UVs for each target face vertex
+        target_uv_coords = np.zeros((total_face_vertices, 2), dtype=np.float64)
+        target_uv_indices = np.arange(total_face_vertices, dtype=np.int32)
+        
+        fv_idx = 0  # face-vertex index
+        for face in target_mesh.faces:
+            for vert_idx in face:
+                # Get the source vertex mapping for this target vertex
+                source_vert_idx = vertex_mapping[vert_idx]
+                
+                if source_vert_idx >= 0:
+                    # Find corresponding source face vertex UV
+                    uv = self._get_source_uv_at_vertex(
+                        source_mesh, source_face_vertex_uvs, source_vert_idx
+                    )
+                    target_uv_coords[fv_idx] = uv
+                else:
+                    # No mapping - use spatial interpolation
+                    uv = self._interpolate_uv_at_position(
+                        target_mesh.vertices[vert_idx],
+                        source_mesh,
+                        source_face_vertex_uvs
+                    )
+                    target_uv_coords[fv_idx] = uv
+                
+                fv_idx += 1
+        
+        return normalize_uv(target_uv_coords), target_uv_indices
+    
+    def _build_source_face_vertex_uvs(
+        self,
+        source_mesh: MeshData,
+        source_uv: UVChannel
     ) -> np.ndarray:
-        """Compute target UV coordinates based on transfer mode."""
-        target_uv = np.zeros((target_mesh.vertex_count, 2), dtype=np.float64)
+        """Build per-face-vertex UV array from source UV channel."""
+        total_face_vertices = sum(len(face) for face in source_mesh.faces)
         
-        if config.mode == TransferMode.DIRECT:
-            target_uv = self._direct_transfer(
-                source_uv.uv_coordinates,
-                vertex_mapping,
-                target_mesh.vertex_count
-            )
-        elif config.mode == TransferMode.SPATIAL:
-            target_uv = self._spatial_transfer(
-                source_mesh,
-                target_mesh,
-                source_uv,
-                vertex_mapping
-            )
+        if len(source_uv.uv_coordinates) == total_face_vertices:
+            # Already per-face-vertex
+            return source_uv.uv_coordinates
+        elif source_uv.uv_indices is not None and len(source_uv.uv_indices) == total_face_vertices:
+            # Use indices to lookup UVs
+            result = np.zeros((total_face_vertices, 2), dtype=np.float64)
+            for i, idx in enumerate(source_uv.uv_indices):
+                if idx < len(source_uv.uv_coordinates):
+                    result[i] = source_uv.uv_coordinates[idx]
+            return result
         else:
-            target_uv = self._interpolated_transfer(
-                source_mesh,
-                target_mesh,
-                source_uv,
-                vertex_mapping
-            )
+            # Fallback: duplicate vertex UVs for each face vertex
+            result = np.zeros((total_face_vertices, 2), dtype=np.float64)
+            fv_idx = 0
+            for face in source_mesh.faces:
+                for vert_idx in face:
+                    if vert_idx < len(source_uv.uv_coordinates):
+                        result[fv_idx] = source_uv.uv_coordinates[vert_idx]
+                    fv_idx += 1
+            return result
+    
+    def _get_source_uv_at_vertex(
+        self,
+        source_mesh: MeshData,
+        source_face_vertex_uvs: np.ndarray,
+        vertex_idx: int
+    ) -> np.ndarray:
+        """Get UV at a specific source vertex (average of all face vertices at this vertex)."""
+        uvs = []
+        fv_idx = 0
+        for face in source_mesh.faces:
+            for v_idx in face:
+                if v_idx == vertex_idx and fv_idx < len(source_face_vertex_uvs):
+                    uvs.append(source_face_vertex_uvs[fv_idx])
+                fv_idx += 1
         
-        return normalize_uv(target_uv)
+        if uvs:
+            return np.mean(uvs, axis=0)
+        return np.array([0.0, 0.0])
+    
+    def _interpolate_uv_at_position(
+        self,
+        position: np.ndarray,
+        source_mesh: MeshData,
+        source_face_vertex_uvs: np.ndarray
+    ) -> np.ndarray:
+        """Interpolate UV at a position using nearest vertices."""
+        nearest_indices, distances = find_nearest_vertices(
+            position.reshape(1, -1),
+            source_mesh.vertices,
+            k=3,
+            return_distances=True
+        )
+        
+        weights = 1.0 / (distances[0] + 1e-10)
+        weights = weights / np.sum(weights)
+        
+        interpolated_uv = np.zeros(2)
+        for j, vert_idx in enumerate(nearest_indices[0]):
+            uv = self._get_source_uv_at_vertex(source_mesh, source_face_vertex_uvs, vert_idx)
+            interpolated_uv += weights[j] * uv
+        
+        return interpolated_uv
     
     def _direct_transfer(
         self,
@@ -390,13 +478,15 @@ class UVTransferEngine:
         mesh: MeshData,
         channel_index: int,
         uv_coords: np.ndarray,
+        uv_indices: np.ndarray,
         create_if_not_exists: bool
     ):
         """Apply UV coordinates to mesh."""
         self.fbx_handler._backend_instance.set_uv_channel(
             mesh,
             channel_index,
-            uv_coords
+            uv_coords,
+            uv_indices
         )
     
     def save_result(self, output_path: str) -> bool:
